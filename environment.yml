@@ -1,0 +1,6 @@
+name: flightwx
+channels: [conda-forge]
+dependencies:
+  - python>=3.10
+  - flask>=3.0
+  - requests>=2.31

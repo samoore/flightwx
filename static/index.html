@@ -1,0 +1,244 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Flight Weather</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.6.0/dist/maplibre-gl.css">
+<style>
+  body{margin:0;font:14px system-ui;display:flex;flex-direction:column;height:100vh}
+  #bar{padding:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+  #info{max-height:38vh;overflow:auto;padding:6px}
+  #xs{width:100%;height:170px;display:block}
+  table{border-collapse:collapse;width:100%}
+  td,th{padding:2px 6px;text-align:right;border-bottom:1px solid #8884}
+  .ar{font-weight:bold;line-height:1;font-size:18px;text-align:center}
+  .dot{width:10px;height:10px;border-radius:50%;border:1px solid #000a}
+  #legend{position:absolute;left:8px;bottom:22px;z-index:2;background:#fffe;color:#000;font-size:12px;line-height:1.5;
+    padding:6px 8px;border-radius:6px;pointer-events:none;max-width:260px}
+  #legend i{display:inline-block;width:10px;height:10px;border-radius:50%;border:1px solid #000a;vertical-align:middle}
+</style>
+<div id="bar">
+  <input id="cs" placeholder="Callsign e.g. ANZ1" size="10">
+  <select id="model" title="Weather model">
+    <option value="">auto (regional → best)</option><option>ecmwf_ifs025</option>
+    <option>gfs_global</option><option>icon_global</option><option>ukmo_global</option>
+  </select>
+  <input id="od" placeholder="override: NZAA-YSSY" size="16" title="Origin-dest ICAO">
+  <input id="dep" type="datetime-local" title="Departure time, your local time (optional; ignored for flights already airborne)">
+  <button onclick="load()">Go / refresh</button>
+  <button onclick="proj()">Globe / flat</button><span id="msg"></span>
+</div>
+<div style="position:relative;flex:1;display:flex;min-height:300px">
+  <div id="map" style="flex:1"></div>
+  <div id="legend">
+    <i style="background:#2c2"></i> VFR <i style="background:#36f"></i> MVFR <i style="background:#e22"></i> IFR
+    <i style="background:#c0c"></i> LIFR <i style="background:#999"></i> n/a<br>
+    <small>airport METAR flight category (hover: raw METAR)</small><br>
+    <span style="background:#f80;opacity:.5;display:inline-block;width:14px;height:10px"></span> SIGMET area (click for text)<br>
+    <small>forecast hazard advisory (thunderstorm, turbulence, icing, ash, cyclone). Not a no-fly zone</small><br>
+    <b>↑</b> forecast wind at flight level (points downwind)<br>
+    <span style="color:#06c">✈</span> aircraft &nbsp; <b>—</b> flown &nbsp; <span style="color:#e33">- -</span> remaining<br>
+    radar: RainViewer rain echoes
+  </div>
+</div>
+<div id="info"><canvas id="xs"></canvas><div id="tbl"></div></div>
+<script src="https://unpkg.com/maplibre-gl@5.6.0/dist/maplibre-gl.js"></script>
+<script>
+if (typeof maplibregl === 'undefined' || location.protocol === 'file:' || !location.port) {
+  document.body.innerHTML = '<p style="padding:1em">This page needs the local server (it calls /api/... and loads MapLibre from unpkg). ' +
+    'Run <code>python app.py</code>, then open <code>http://127.0.0.1:8000/</code> in a normal browser tab. ' +
+    'It will not work in a sandboxed preview pane.</p>';
+  throw new Error('flightwx: not served by app.py');
+}
+const $ = id => document.getElementById(id), R = Math.PI/180;
+const LEVELS = [850,700,500,400,300,250,200,150], CAT = {VFR:'#2c2',MVFR:'#36f',IFR:'#e22',LIFR:'#c0c'};
+let globe = true, markers = [];
+const map = new maplibregl.Map({container:'map', center:[174,-41], zoom:2, style:{version:8,
+  projection:{type:'globe'},
+  sources:{osm:{type:'raster',tiles:['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],tileSize:256,attribution:'© OpenStreetMap'}},
+  layers:[{id:'osm',type:'raster',source:'osm'}]}});
+const ready = new Promise(r => map.on('load', r));
+function proj() { map.setProjection({type:(globe = !globe) ? 'globe' : 'mercator'}); }
+
+function setGeo(id, data, layers) {
+  if (map.getSource(id)) return map.getSource(id).setData(data);
+  map.addSource(id, {type:'geojson', data});
+  layers.forEach(l => map.addLayer({...l, source:id}));
+}
+async function addRadar() {  // RainViewer global radar mosaic (check current terms/limits)
+  try {
+    const j = await (await fetch('https://api.rainviewer.com/public/weather-maps.json')).json();
+    if (map.getLayer('radar')) { map.removeLayer('radar'); map.removeSource('radar'); }
+    map.addSource('radar', {type:'raster', tileSize:256, tiles:[`${j.host}${j.radar.past.at(-1).path}/256/{z}/{x}/{y}/2/1_1.png`]});
+    map.addLayer({id:'radar', type:'raster', source:'radar', paint:{'raster-opacity':.6}}, map.getLayer('route') ? 'route' : undefined);
+  } catch (e) {}
+}
+function pin(lon, lat, html, tip) {
+  const e = document.createElement('div'); e.className = 'ar'; e.innerHTML = html; if (tip) e.title = tip;
+  markers.push(new maplibregl.Marker({element:e}).setLngLat([lon, lat]).addTo(map));
+}
+
+function gc(a, b, n) {  // great-circle points a->b with distance (km)
+  const [p1,l1,p2,l2] = [a[0]*R, a[1]*R, b[0]*R, b[1]*R];
+  const d = 2*Math.asin(Math.sqrt(Math.sin((p2-p1)/2)**2 + Math.cos(p1)*Math.cos(p2)*Math.sin((l2-l1)/2)**2));
+  return Array.from({length:n+1}, (_, i) => {
+    const f = i/n, A = d ? Math.sin((1-f)*d)/Math.sin(d) : 1, B = d ? Math.sin(f*d)/Math.sin(d) : 0;
+    const x = A*Math.cos(p1)*Math.cos(l1) + B*Math.cos(p2)*Math.cos(l2);
+    const y = A*Math.cos(p1)*Math.sin(l1) + B*Math.cos(p2)*Math.sin(l2);
+    const z = A*Math.sin(p1) + B*Math.sin(p2);
+    return {lat:Math.atan2(z, Math.hypot(x,y))/R, lon:Math.atan2(y,x)/R, km:f*d*6371};
+  });
+}
+function ahead(p, brg, km) {  // fallback destination when route unknown
+  const d = km/6371, b = brg*R, p1 = p[0]*R, l1 = p[1]*R;
+  const p2 = Math.asin(Math.sin(p1)*Math.cos(d) + Math.cos(p1)*Math.sin(d)*Math.cos(b));
+  return [p2/R, (l1 + Math.atan2(Math.sin(b)*Math.sin(d)*Math.cos(p1), Math.cos(d)-Math.sin(p1)*Math.sin(p2)))/R];
+}
+const fl = p => Math.round(145366*(1-(p/1013.25)**0.190284)/100);           // hPa -> FL (ISA)
+const flightLevelHPa = ft => LEVELS.reduce((a, b) => Math.abs(fl(b)*100-ft) < Math.abs(fl(a)*100-ft) ? b : a);
+
+function xsec(wx, lvls) {  // wind-speed curtain along route; levels equally spaced, highest at top
+  const c = $('xs'), W = c.width = c.clientWidth, H = c.height = 170, m = 44, n = wx.length;
+  const cw = (W-m)/n, ch = H/LEVELS.length, g = c.getContext('2d');
+  g.font = '11px system-ui'; g.textBaseline = 'middle';
+  LEVELS.forEach((l, j) => {
+    const y = H - (j+1)*ch;
+    g.fillStyle = getComputedStyle(document.body).color; g.fillText('FL'+fl(l), 2, y+ch/2);
+    wx.forEach((w, i) => {
+      const s = w.lv[l].ws; if (s == null) return;
+      g.fillStyle = `hsl(${240-240*Math.min(s,150)/150},70%,55%)`; g.fillRect(m+i*cw, y, cw+1, ch);
+      g.fillStyle = '#000'; g.fillText(Math.round(s), m+i*cw+cw/2-8, y+ch/2);
+    });
+    wx.forEach((_, i) => { if (lvls[i] === l) { g.strokeStyle = '#000'; g.lineWidth = 2; g.strokeRect(m+i*cw, y, cw, ch); } });
+  });
+}
+
+const TAS = 480, DETOUR = 1.04;  // kt cruise true airspeed; flown route ~4% longer than great circle
+const brg = (a, b) => {
+  const dl = (b.lon-a.lon)*R, y = Math.sin(dl)*Math.cos(b.lat*R);
+  const x = Math.cos(a.lat*R)*Math.sin(b.lat*R) - Math.sin(a.lat*R)*Math.cos(b.lat*R)*Math.cos(dl);
+  return (Math.atan2(y, x)/R + 360) % 360;
+};
+function setTimes(pts, wx, ai, t0) {  // segment speed = TAS + forecast tail/headwind; times anchored at index ai
+  const dt = i => {
+    const b = brg(pts[i-1], pts[i]); let tail = 0;
+    if (wx) [i-1, i].forEach(k => { const w = wx[k].lv[pts[k].lvl];
+      if (w.ws != null) tail += w.ws*Math.cos(((w.wd+180) - b)*R)/2; });
+    return (pts[i].km-pts[i-1].km)*DETOUR / (Math.max(TAS+tail, 250)*1.852) * 3.6e6;
+  };
+  const t = [];
+  t[ai] = t0;
+  for (let i = ai+1; i < pts.length; i++) t[i] = t[i-1] + dt(i);
+  for (let i = ai; i > 0; i--) t[i-1] = t[i] - dt(i);
+  pts.forEach((p, i) => p.t = t[i]);
+}
+const planeSvg = (deg, col) => `<div style="transform:rotate(${deg}deg)"><svg width="34" height="34" viewBox="0 0 24 24"
+  style="filter:drop-shadow(0 0 2px #fff)"><path fill="${col}" stroke="#fff" stroke-width=".8"
+  d="M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5S10 2.67 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"/></svg></div>`;
+ready.then(() => map.on('click', 'sigmet-f', e => { const p = e.features[0].properties;
+  new maplibregl.Popup().setLngLat(e.lngLat).setText(`${p.h || 'SIGMET'} ${p.s || ''}: ${p.raw || ''}`).addTo(map); }));
+const hr = t => new Date(Math.round(t/3.6e6)*3.6e6).toISOString().slice(0,13) + ':00';
+
+async function load() {
+  const cs = $('cs').value.trim().toUpperCase(), od = $('od').value.trim().toUpperCase();
+  if (!cs && !od) return;
+  history.replaceState(0, '', '?' + new URLSearchParams({cs, od, dep:$('dep').value}));
+  $('msg').textContent = ' loading…';
+  let f = null, err = '';  // f: route, codes, live flag (+ position) or dep_ms/dep_src
+  if (cs) { const r = await fetch('/api/flight/' + cs), j = await r.json(); r.ok ? f = j : err = j.error; }
+  const live = f?.live ? f : null;
+  let route = f?.route, codes = f?.codes;
+  if (od) {      // manual origin-dest overrides ADS-B route; also enables not-yet-departed flights
+    const ids = od.split(/[-, ]+/), r = await fetch('/api/airports?ids=' + ids);
+    if (!r.ok) { $('msg').textContent = ' unknown ICAO code'; return; }
+    route = await r.json(); codes = ids;
+  }
+  if (!route && live) route = [[live.lat, live.lon], ahead([live.lat, live.lon], live.track, 3000)];
+  if (!route) { $('msg').textContent = ' ' + (err || 'enter a flight number'); return; }
+  await ready;
+  const cruise = live?.alt_ft > 25000 ? live.alt_ft : 35000, here = live && [live.lat, live.lon];
+  const start = route[0], end = route.at(-1);
+  let pts, nowIdx = -1, anchorIdx = 0, anchorT, depSrc;
+  if (live) {  // path = origin -> aircraft -> destination, so the plane sits on the plotted line
+    const a = gc(start, here, 5), b = gc(here, end, 7), D1 = a.at(-1).km;
+    pts = [...a, ...b.slice(1).map(p => ({...p, km: p.km + D1}))];
+    nowIdx = anchorIdx = a.length - 1; anchorT = Date.now(); depSrc = 'estimated from position';
+  } else {
+    pts = gc(start, end, 12);
+    if ($('dep').value) { anchorT = new Date($('dep').value).getTime(); depSrc = 'entered'; }
+    else { anchorT = f?.dep_ms ?? Date.now(); depSrc = f?.dep_src ?? 'assumed now'; }
+  }
+  const total = pts.at(-1).km;
+  pts.forEach(p => {  // planned profile (assumption): ~250 km climb, ~200 km descent; actual altitude where known
+    p.alt = cruise * Math.min(1, p.km/250, (total-p.km)/200);
+    p.lvl = flightLevelHPa(Math.max(p.alt, 5000));
+  });
+  if (live) { pts[nowIdx].alt = live.alt_ft; pts[nowIdx].lvl = flightLevelHPa(live.alt_ft); }
+  const getWx = async () => (await fetch(`/api/wx?model=${$('model').value}&pts=` +
+    pts.map(p => [p.lat.toFixed(2), p.lon.toFixed(2), hr(p.t)].join(',')).join(';'))).json();
+  setTimes(pts, null, anchorIdx, anchorT);             // pass 1: still-air times
+  let wx = await getWx();
+  const h1 = pts.map(p => hr(p.t));
+  setTimes(pts, wx, anchorIdx, anchorT);               // pass 2: wind-adjusted; refetch if the hours moved
+  if (pts.some((p, i) => hr(p.t) !== h1[i])) wx = await getWx();
+
+  const tn = Date.now(); let pi = nowIdx, heading = live?.track ?? 0, status = 'live (ADS-B)';
+  if (!live) {  // not on ADS-B: at origin, at destination, or interpolated by time
+    pi = tn <= pts[0].t ? 0 : tn >= pts.at(-1).t ? pts.length-1 : pts.findIndex(p => p.t >= tn);
+    status = pi === 0 && tn <= pts[0].t ? 'not yet departed (shown at origin)'
+           : pi === pts.length-1 && tn >= pts.at(-1).t ? 'arrived (shown at destination, from times)'
+           : 'position estimated from times (not seen on ADS-B)';
+    heading = brg(pts[Math.max(pi-1, 0)], pts[Math.min(pi+1, pts.length-1)]);
+  }
+
+  let prev = pts[0].lon;  // unwrap longitudes across the dateline (after the weather requests)
+  pts.forEach(p => { while (p.lon-prev > 180) p.lon -= 360; while (prev-p.lon > 180) p.lon += 360; prev = p.lon; });
+  const lons = pts.map(p => p.lon), lats = pts.map(p => p.lat);
+  const seg = (ps, done) => ({type:'Feature', properties:{done}, geometry:{type:'LineString', coordinates:ps.map(p => [p.lon, p.lat])}});
+  setGeo('route', {type:'FeatureCollection', features:[seg(pts.slice(0, pi+1), 1), seg(pts.slice(pi), 0)]
+      .filter(x => x.geometry.coordinates.length > 1)},
+    [{id:'flown', type:'line', filter:['==', ['get','done'], 1], paint:{'line-color':'#222','line-width':3}},
+     {id:'route', type:'line', filter:['==', ['get','done'], 0], paint:{'line-color':'#e33','line-width':2,'line-dasharray':[2,2]}}]);
+  markers.forEach(m => m.remove()); markers = [];
+  const flStr = ft => 'FL' + String(Math.round(ft/100)).padStart(3, '0');
+  const fmt = (v, d = 0) => v == null ? '–' : v.toFixed(d);
+  const cloud = c => c == null ? '–' : c === 'clear' ? 'clear' : `${flStr(c.base)}–${flStr(c.top)}`;
+  let rows = '';
+  pts.forEach((p, i) => {
+    const x = wx[i], w = x.lv[p.lvl], mark = i === pi, now = i === nowIdx, flag = (x.lpi > 0 || x.cape > 500) ? '⚡' : '';
+    if (w.ws != null && !mark) pin(p.lon, p.lat, `<div style="transform:rotate(${w.wd+180}deg)">↑</div>`, `${Math.round(w.ws)} kt ${flag}`);
+    rows += `<tr${mark ? ' style="font-weight:bold"' : ''}><td>${mark ? '✈ ' : ''}${new Date(p.t).toISOString().slice(11,16)}Z</td>
+      <td>${Math.round(p.km)} km</td><td>${now ? '' : '~'}${flStr(p.alt)}</td>
+      <td>${w.ws == null ? '–' : Math.round(w.wd)+'°/'+Math.round(w.ws)+' kt'}</td><td>${fmt(w.w, 1)}</td><td>${fmt(w.t)}</td>
+      <td>${fmt(x.precip, 1)}</td><td>${cloud(x.cloud)}</td><td>${x.cape ?? '–'}</td><td>${x.lpi ?? '–'} ${flag}</td></tr>`;
+  });
+  const dur = (pts.at(-1).t - pts[0].t)/3.6e6;
+  $('tbl').innerHTML = `<b>${cs}</b> ${codes ? codes.join('→') : ''} · ${status} · dep ${new Date(pts[0].t).toISOString().slice(11,16)}Z (${depSrc})
+    · est. duration ${Math.floor(dur)}h${String(Math.round((dur%1)*60)).padStart(2,'0')} (TAS ${TAS} kt + forecast wind)
+    <table><tr><th>Time</th><th>Dist</th><th>Alt</th><th>Wind</th><th>Vert m/s</th><th>Temp °C</th><th>Rain mm/h</th>
+    <th>Cloud base–top</th><th>CAPE</th><th>Lightning</th></tr>${rows}</table>
+    <small>✈ row = aircraft position. Alt: live (ADS-B) only on a live aircraft's row; other rows are a ~planned profile. Times are modelled, not scheduled. Vert: + up.
+    Cloud: layers with ≥50% cover on pressure levels (coarse).</small>`;
+  xsec(wx, pts.map(p => p.lvl));
+
+  let sig = [];  // METARs + SIGMETs along the route
+  try {
+    const bb = [Math.min(...lats)-2, Math.min(...lons)-2, Math.max(...lats)+2, Math.max(...lons)+2].map(x => x.toFixed(1));
+    const o = await (await fetch('/api/obs?bbox=' + bb)).json();
+    o.metar.forEach(m => pin(m.lon, m.lat, `<div class="dot" style="background:${CAT[m.cat] || '#999'}"></div>`, m.raw));
+    sig = o.sigmet;
+  } catch (e) {}
+  setGeo('sigmet', {type:'FeatureCollection', features:sig.map(s => ({type:'Feature', properties:{h:s.hazard, s:s.sev, raw:s.raw},
+    geometry:{type:'Polygon', coordinates:[s.coords]}}))},
+    [{id:'sigmet-f', type:'fill', paint:{'fill-color':'#f80','fill-opacity':.25}},
+     {id:'sigmet-l', type:'line', paint:{'line-color':'#f80','line-width':1.5}}]);
+  pin(pts[pi].lon, pts[pi].lat, planeSvg(heading, live ? '#06c' : '#888'), `${cs} · ${status}`);  // plane on top
+  addRadar();
+  map.fitBounds([[Math.min(...lons), Math.min(...lats)], [Math.max(...lons), Math.max(...lats)]], {padding:40, maxZoom:5});
+  $('msg').textContent = ' updated ' + new Date().toLocaleTimeString();
+}
+
+const q = new URLSearchParams(location.search);
+['cs','od','dep'].forEach(k => $(k).value = q.get(k) || '');
+if ($('cs').value || $('od').value) load();
+setInterval(() => ($('cs').value || $('od').value) && load(), 120000);
+</script>
